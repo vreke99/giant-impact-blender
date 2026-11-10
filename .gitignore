@@ -1,0 +1,17 @@
+# Outputs and data: these live on the data disk, not in the repository
+*.ply
+*.npz
+*.vdb
+*.blend
+*.blend1
+*.png
+*.mp4
+*.hdf5
+*.part
+# Logs and Python/LaTeX by-products
+*.out
+*.err
+*.log
+__pycache__/
+*.aux
+*.toc

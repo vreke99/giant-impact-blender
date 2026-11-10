@@ -1,0 +1,535 @@
+\documentclass[11pt]{article}
+ 
+\usepackage[margin=1in]{geometry}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{parskip}
+\usepackage{array}
+\usepackage{longtable}   % parameter tables may run across pages
+\newcolumntype{P}[1]{>{\raggedright\arraybackslash}p{#1}}
+ 
+\definecolor{linkblue}{RGB}{20,80,160}
+\hypersetup{colorlinks=true, urlcolor=linkblue, linkcolor=linkblue,
+            pdftitle={Giant-Impact Animation Pipeline}}
+ 
+ 
+\setlist[itemize]{leftmargin=1.4em, itemsep=2pt, topsep=3pt}
+\setlist[enumerate]{leftmargin=1.6em, itemsep=2pt, topsep=3pt}
+ 
+ 
+\newcommand{\pc}[1]{\texttt{#1}}
+ 
+\title{\textbf{Animating in Blender Guide}\\[2pt]}
+ 
+\author{Callum Mosley, Vince Eke, Prof Claude}
+\date{\today}
+ 
+\begin{document}
+\sloppy
+\maketitle
+ 
+\noindent
+A single Python pipeline turns a directory of SWIFT giant-impact snapshots (\pc{.hdf5}, one per frame) into a rendered animation. Stage~1 (the science environment, on COSMA compute nodes) does the physics and geometry; stage~2 (Blender's own Python) sets the look, assembles the scene and makes a template; stage~3 (also Blender, on a GPU machine) renders every frame from that template. One parameter, \pc{RENDER\_MODE}, chooses how the simulation is drawn, and the same three scripts serve every choice. This document gives an overview, then covers each stage, a checklist for a full run, and finally the Blender controls you are most likely to want if you adjust a scene by hand in the GUI.
+ 
+% =====================================================================
+\section{What you need}
+% =====================================================================
+\begin{enumerate}
+  \item \textbf{Blender 5.x} -- download from
+        \url{https://www.blender.org/download/} (the GUI notes below were written against 5.1; the mad06 build is 5.3). Blender ships its own Python, so stages~2 and~3 need no
+        package installation; OpenVDB, needed for the mist modes, is included in recent builds.
+  \item \textbf{Python 3.10 or later} for stage~1 with six packages. On COSMA, \pc{module load python/3.12.4} and install with the same \pc{python3} you will run, so that the packages land in the right place:
+\end{enumerate}
+ 
+\begin{verbatim}
+module load python/3.12.4
+python3 -m pip install --user swiftsimio scikit-image scipy h5py \
+                               numpy pysplashsurf
+\end{verbatim}
+ 
+Elsewhere, a conda environment or venv works equally well (\pc{python3.12 -m venv giantimpact}, \pc{source giantimpact/bin/activate}, then the same \pc{pip install}). \pc{pysplashsurf}, which makes the surface meshes, needs Python~3.10 or later; with an older Python, pip silently installs an out-of-date version.
+ 
+% =====================================================================
+\section{Overview}
+% =====================================================================
+ 
+\subsection{Body, rest and render modes}
+Every particle is either \textbf{body} -- at least \pc{SURFACE\_RHO} (1000\,kg\,m$^{-3}$) dense, inside the box, and with at least \pc{MIN\_NEIGHBOURS} body neighbours (which drops lone dense specks) -- or \textbf{rest}, which is everything else. Each particle is therefore shown exactly once. The body is drawn as particles or as a surface mesh, and the rest as particles or as a glowing volume (mist); \pc{RENDER\_MODE} names the two choices, body first:
+ 
+\begin{center}\small
+\begin{tabular}{@{}P{3.2cm} P{5.2cm} P{6.1cm}@{}}
+\hline
+\textbf{\pc{RENDER\_MODE}} & \textbf{Body} & \textbf{Rest} \\
+\hline
+\pc{PARTICLES}       & particles & particles, fading out at low density \\
+\pc{MESH\_PARTICLES} & surface mesh (splashsurf) & particles, fading out at low density \\
+\pc{MESH\_MIST}      & surface mesh (splashsurf) & mist \\
+\pc{PARTICLES\_MIST} & particles & mist \\
+\hline
+\end{tabular}
+\end{center}
+ 
+Making the mesh (stage~1) and the mist (stages~1 and~2) are the expensive steps; particles are cheap.
+ 
+\subsection{The scripts}
+\begin{itemize}
+  \item \textbf{\pc{combined\_01\_make.py}}, run in chunks on COSMA compute nodes by \pc{stage1\_slurm.sh} -- reads the \pc{.hdf5} snapshots and writes the body and rest files for the chosen mode. A few test frames can be run directly on a login node.
+  \item \textbf{\pc{combined\_02\_build.py}} -- builds the Blender scene. Either renders a handful of test frames to iterate on the look, or (\pc{MAKE\_TEMPLATE = True}) writes the final \pc{.blend} template and, for mist modes, the \pc{.vdb} files.
+  \item \textbf{\pc{combined\_03\_render\_chunk.py}} with \pc{render\_chunks.sh} -- renders a range of frames from the template; the shell wrapper splits the run into chunks and runs several at once on the GPU.
+\end{itemize}
+ 
+\subsection{Where the files go}
+All outputs live in the run directory \pc{BASE\_DIR/SIM\_NAME/}. Each file depends only on its own style, so modes share files: \pc{MESH\_PARTICLES} reuses the meshes of a \pc{MESH\_MIST} run, \pc{PARTICLES\_MIST} reuses its volume and \pc{.vdb} files, and \pc{PARTICLES} reuses the body particles of \pc{PARTICLES\_MIST} and each stage remakes only the files whose settings have changed (section~\ref{sec:stale}).
+ 
+\begin{center}\small
+\begin{tabular}{@{}P{3.0cm} P{5.6cm} P{5.9cm}@{}}
+\hline
+& \textbf{Particles} & \textbf{Mesh / mist} \\
+\hline
+\textbf{Body} & \pc{particles/body\_NNNN.ply} & \pc{meshes/body\_NNNN.ply} \\
+\textbf{Rest} & \pc{particles/rest\_NNNN.ply} & \pc{volume/volume\_NNNN.npz} (stage~1) $\rightarrow$ \pc{vdb/mist\_NNNN.vdb} (stage~2) \\
+\hline
+\end{tabular}
+\end{center}
+ 
+Stage~2 test renders go to \pc{renders/}, and its template is \pc{SIM\_NAME\_mode\_camera.blend} (e.g.\ \pc{...\_mesh\_mist\_persp.blend}, or \pc{...\_mesh\_mist\_vr360\_3d.blend} for stereo), so templates for different modes and cameras sit side by side. A test run saves \pc{...\_test.blend} instead, so it never overwrites a template. Stage~3 renders go to \pc{renders\_mode/}, named \pc{frame\_NNNN.png}, or \pc{fish\_NNNN.png} for the fisheye camera and \pc{vr360\_NNNN.png} for the 360-degree camera, with \pc{\_3d} added for stereo (e.g.\ \pc{vr360\_3d\_NNNN.png}).
+ 
+\subsection{Workflow}
+\begin{enumerate}
+  \item Stage~1 on a few test frames (login node, or a short batch job).
+  \item Stage~2 test renders (\pc{MAKE\_TEMPLATE = False}); adjust stage-2 parameters, including the colours, until happy.
+  \item Stage~1 on all frames with \pc{stage1\_slurm.sh}.
+  \item Stage~2 once more with \pc{MAKE\_TEMPLATE = True} to write the template (and all \pc{.vdb} files).
+  \item Render one short chunk (e.g.\ frames 0--2) with stage~3 and check it, then the whole run with \pc{render\_chunks.sh}; then make the movie (stage~4).
+\end{enumerate}
+ 
+\textbf{Frame numbering.} Frame~0 is the initial-conditions file and frame~$N$ the $N$th snapshot. Blender numbers its frames from~1, so snapshot~$N$ is Blender frame~$N+1$ throughout; the camera keyframes in stage~2 use Blender frames.
+ 
+\textbf{Choosing frames.} Stages~1 and~2 take frames on the command line in any mix of \pc{800}, \pc{300-319} (inclusive) and \pc{0-2160/100} (every 100th); stage~1 also accepts \pc{all}, or \pc{START END} as used by the batch script. In stage~2 the frames come after Blender's \pc{--}.
+ 
+% =====================================================================
+\section{Stage 1 -- processing the .hdf5 snapshots}
+% =====================================================================
+Each snapshot is read and centred on its centre of mass. \textbf{One Blender unit is the simulation's own length unit}, read from the snapshots (the Earth radius for this run), so lengths in Blender read as they do in the simulation, with each frame's centre of mass at the origin. Stage~1 prints the unit, and the size of the simulation domain in the same units. Only material inside a cube of side \pc{BOX\_SIZE} is drawn. Choose it to hold everything you want to see over the whole run: each frame reports the percentage of its dense material that falls outside, as a guide. Particle masses and material IDs come from the IC file, matched by particle ID. All quantities are in SI units.
+ 
+\textbf{Body mesh.} The surface is made by splashsurf (\pc{pysplashsurf}) directly from the body particles: a sparse marching-cubes grid with weighted Laplacian smoothing, so its detail follows the particle resolution rather than a fixed grid, and thin tidal tails come out as clean surfaces. splashsurf's iso level is a ``fluid fraction'' ($\sim$1 inside any group of particles, however sparse), so it cannot tell dense material from debris itself; that is why the body is chosen by density first. Its particle radius is that of a sphere holding one particle at \pc{SURFACE\_RHO} ($\sim$77\,km here), which sets the finest detail.
+ 
+\textbf{Rest particles} fade in, through their alpha, between the two densities in \pc{REST\_FADE\_RHO}; thinner material is left out. This keeps the debris localised rather than spread into a wide halo, and the gradual fade stops particles popping on and off between frames.
+ 
+\textbf{Mist.} The volume files hold density and heat (temperature) grids of the rest particles only, made with swiftsimio's \pc{render\_gas} on a \pc{RESOLUTION}$^3$ grid; the body particles are given zero mass there.
+ 
+\textbf{Physics, not colour.} The files carry what the material is, not how it should look: every particle and mesh vertex has its temperature (\pc{T\_K}) and iron fraction (\pc{iron}), and the volume files hold density (kg\,m$^{-3}$) and temperature grids. All colour is decided in stage~2 (section~\ref{sec:colour}), so the look can be changed without rerunning this stage. Each particle also carries a \pc{radius\_factor}, from 0.5 at \pc{RHO\_DEBRIS} to 1.0 at \pc{RHO\_BODY}, which sets its size and, in stage~2, how strongly it glows, and rest particles an \pc{opacity}, their density fade. Stage~1 prints the 5/50/95\% surface temperatures of each mesh, which are a good guide to stage~2's \pc{GLOW\_K}.
+ 
+\subsection{Important parameters}
+ 
+{\small
+\begin{longtable}{@{}P{4.3cm} P{2.0cm} P{8.2cm}@{}}
+\hline
+\textbf{Parameter} & \textbf{Default} & \textbf{Effect} \\
+\hline
+\endhead
+\pc{SIM\_NAME}, \pc{BASE\_DIR} & -- & Used to find ICs, snapshots and set outputs -- assumes our typical directory structure. \\
+\pc{RENDER\_MODE} & \pc{MESH\_MIST} & See the table above. \textbf{Must equal stage 2.} \\
+\pc{TEST\_FRAMES} & 7 frames & Frames processed when none are given on the command line. \\
+\pc{FORMAT\_VERSION} & \pc{1} & Part of every file's fingerprint (section~\ref{sec:stale}). Only needed if you edit the code itself: add one and every file is remade. \\
+\pc{BOX\_SIZE} & \pc{20} & Side of the box, in Blender units. A larger box holds more of the outer debris, but spreads the mist grid's \pc{RESOLUTION} cells more thinly. Changing it does not change the framing, which the camera sets. \\
+\pc{BLENDER\_UNIT\_M} & \pc{None} & Metres per Blender unit; \pc{None} uses the snapshots' length unit. \\
+\pc{SURFACE\_RHO} & \pc{1000} & SI density dividing body from rest, in every mode. \\
+\pc{MIN\_NEIGHBOURS} & \pc{4} & Body particles need this many body neighbours within 2 particle radii (0 = off). \\
+\pc{RHO\_DEBRIS}, \pc{RHO\_BODY} & \pc{1000}, \pc{2000} & SI densities over which \pc{radius\_factor} ramps from 0.5 to 1. \\
+\pc{REST\_FADE\_RHO} & \pc{(5, 20)} & SI densities over which rest particles fade in; lower shows more diffuse debris. \\
+\pc{SPLASH\_CUBE\_SIZE} & \pc{0.5} & Mesh cell size in particle radii; smaller is finer, with $\sim$1/size$^2$ more triangles. \\
+\pc{SPLASH\_SMOOTH\_ITERS} & \pc{10} & Mesh smoothing passes; fewer keeps more detail, more removes per-particle bumps. \\
+\pc{SPLASH\_ISO}, \pc{SPLASH\_SMOOTHING\_LEN}, \pc{SPLASH\_NORMALS\_ITERS} & \pc{0.6}, \pc{2.0}, \pc{10} & splashsurf's iso level, kernel size and normal smoothing; rarely need changing. \\
+\pc{RESOLUTION} & \pc{256} & Mist grid cells per side; a multiple of stage~2's \pc{VDB\_RES}. Stored in half precision (float16), which is ample for rendering; temperatures are capped at \pc{MIST\_MAX\_T\_K} (60\,000\,K). At 384 the volume files took 258\,GB for this run, more than the snapshots. \\
+\pc{IRON\_ID} & \pc{402} & \pc{MaterialID} of iron; others are rock. \\
+\pc{TARGET\_MAX\_ID} & \pc{None} & Particle IDs up to this are the target, higher ones the impactor, for colouring by body (stage~2). \pc{None} finds it by splitting the two bodies in the IC file, and stops if the target's IDs are not the lowest block. \\
+\hline
+\end{longtable}
+}
+ 
+\subsection{Anticipated operation}
+For a few test frames on a cosma5 login node, limit splashsurf's threads (it otherwise uses every core):\newline
+\pc{env RAYON\_NUM\_THREADS=4 python3 combined\_01\_make.py 300-319}\newline
+(\pc{env} is needed in tcsh.) For a full run, submit the job array from the directory holding the scripts:\newline
+\pc{sbatch stage1\_slurm.sh}\hfill(frames 0--2160 in 20 chunks)\newline
+\pc{sbatch --array=0 stage1\_slurm.sh 300 319}\hfill(one task, e.g.\ to measure memory)\newline
+The frame range is split evenly over the array tasks, so \pc{--array} alone sets the number of chunks, and \pc{--cpus-per-task}, \pc{--mem} and \pc{-t} on the command line override the script. Each task writes \pc{stage1\_JOB\_TASK.out} and \pc{.err}; failed frames are reported at the end of the \pc{.out} file, and a rerun of the chunk does only what is missing or out of date.
+ 
+\textbf{Memory.} sacct's \pc{MaxRSS} includes the node's file cache, which fills up to whatever \pc{--mem} is requested, so it is no guide. The true peak is the ``Maximum resident set size'' line written to the \pc{.err} file by \pc{/usr/bin/time -v}. COSMA5 charges about 4.8\,GB of memory per core, rounding up to whole cores, so with 4 cores up to 19\,GB costs nothing extra. Small, short jobs (a few cores, under 3\,hours) are backfilled quickly even when the queue is busy.
+ 
+\subsection{Typical resources used}
+For 2160 $3\times10^6$-particle snapshots, \pc{BOX\_SIZE} $=35$, \pc{RESOLUTION} $=256$, on cosma5 (remaking only the volume files took $\sim$22\,min in 20 chunks):
+ 
+\begin{center}\small
+\begin{tabular}{@{}P{4.4cm} P{4.6cm} P{5.5cm}@{}}
+\hline
+\textbf{Run} & \textbf{Request} & \textbf{Time and true peak memory} \\
+\hline
+\pc{MESH\_MIST}, all new & 20 chunks $\times$ 4 cores, 19\,GB & up to 1\,h\,42\,min per chunk ($\sim$25\,s splash + $\sim$15\,s mist per frame); $\sim$10\,GB \\
+Particles only (\pc{PARTICLES}) & 10 chunks $\times$ 1 core, 4\,GB & $\sim$15\,min; $\sim$0.8\,GB \\
+Reusing meshes or mist & 10--20 chunks $\times$ 1--4 cores, 4\,GB & 15--50\,min (more cores speed up the neighbour search); $\sim$0.9\,GB \\
+\hline
+\end{tabular}
+\end{center}
+ 
+Disk: meshes 10--45\,MB per frame (57\,GB), volume files $\sim$9\,MB per frame in half precision (20\,GB; 258\,GB at \pc{RESOLUTION} $=384$ in full precision with a smaller box), particle files $\sim$35\,MB per frame per component ($\sim$77\,GB for all particles).
+ 
+% =====================================================================
+\section{Stage 2 -- setting the scene using Blender}
+% =====================================================================
+Stage~2 reads the stage-1 files for the chosen mode and turns them into a configured Blender scene: it imports the geometry, builds the materials (\pc{BodyLook} for the mesh, \pc{ParticleLook} for all particles, \pc{MistLook} for the volume), sets up the Geometry Nodes that draw each particle as a sphere of radius \pc{PARTICLE\_RADIUS} $\times$ \pc{radius\_factor}, the lighting (\pc{KeySun} and \pc{FillSun}), and the camera and its keyframes. Particles are lit by the suns as well as glowing, and partly transparent, so cool debris still shows and debris in front of the body only tints it.
+ 
+With \pc{MAKE\_TEMPLATE = False} it renders the test frames to \pc{renders/} (with EEVEE, except for the fisheye camera) and saves a \pc{.blend} that still contains those frames -- the one to open in the GUI. With \pc{MAKE\_TEMPLATE = True} it builds the \pc{.vdb} files (mist modes), renders \pc{TEMPLATE\_FRAME} as a check, removes all per-frame objects and saves the template. The template keeps the materials, camera, lights and a hidden \pc{PointsTemplate} object carrying the Geometry Nodes, and records the mode, the run directory and the component files, so stage~3 needs no settings of its own. The \pc{.vdb} files hold the mist's density (\pc{rho}) and mass-weighted temperature (\pc{T\_K}).
+ 
+\textbf{Colour.}\label{sec:colour} One node group, \pc{HeatLook}, colours the body, the particles and the mist alike, from temperature and iron fraction, so material looks the same whichever side of the body/rest split it falls. Every surface (and the mist, as dust) has its material's own colour -- rock or iron -- lit by the suns. Hot material also glows, in the \pc{PALETTE} colour for its temperature, with a strength rising smoothly (in $\log T$) from 0 to 1 across \pc{GLOW\_K}. So the cool crust stays dark and only hot material, such as cracks and the impact site, shines. Colours are given as display (sRGB) values, as in a colour picker. Since the colour is set here, it can be tuned with test renders alone.
+ 
+\subsection{Important parameters}
+ 
+{\small
+\begin{longtable}{@{}P{4.3cm} P{2.0cm} P{8.2cm}@{}}
+\hline
+\textbf{Parameter} & \textbf{Default} & \textbf{Effect} \\
+\hline
+\endhead
+\multicolumn{3}{c}{\textbf{General}}\\
+\hline
+\pc{SIM\_NAME}, \pc{BASE\_DIR} & -- & \textbf{Must equal stage 1.} \\
+\pc{RENDER\_MODE} & \pc{MESH\_MIST} & \textbf{Must equal stage 1}; also sets the template filename. \\
+\pc{BODY\_ON}, \pc{REST\_ON} & \pc{True} & Include the body and the rest in the test renders; \pc{REST\_ON = False} in a mist mode also skips building \pc{.vdb} files. \\
+\pc{MAKE\_TEMPLATE} & \pc{False} & \pc{False}: render the test frames. \pc{True}: make the template (and \pc{.vdb} files), checking with \pc{TEMPLATE\_FRAME}. Stage~3 only accepts a template. \\
+\pc{TEST\_FRAMES}, \pc{TEMPLATE\_FRAME} & -- & Test frames (or give them after \pc{--}), and the check frame in template mode. \\
+\pc{CAMERA\_MODE} & \pc{PERSP} & Perspective (\pc{PERSP}, 1280$\times$720), orthographic (\pc{ORTHO}), planetarium (\pc{FISHEYE}, 4096$\times$4096, Cycles) or 360-degree for a headset (\pc{VR360}, 4096$\times$2048, Cycles). The path is the \pc{PATH} list of (Blender frame, camera position relative to the centre, in Blender units); Blender eases smoothly between them. \\
+\pc{CAMERA\_VIEW} & \pc{(1.0, 0, None)} & Adjusts \pc{PATH} for this template: (distance scale, turn about the spin ($z$) axis in degrees, elevation above the collision plane in degrees or \pc{None} for as in \pc{PATH}). One path then serves every projection, e.g.\ \pc{(0.22, 0, 70)} for the dome, looking down on the collision, and \pc{(0.22, 180, 45)} for a headset. \pc{camera\_clearance.py} reports, for candidate views, how close dense material comes to the camera; on a dome or in a headset, material passing close is uncomfortable. Not used by \pc{ORTHO}. \\
+\pc{DOME\_TILT\_DEG}, \pc{DOME\_AZ\_DEG} & \pc{40}, \pc{10} & Tilt and azimuth of the fisheye view. \\
+\pc{STEREO} & \pc{False} & Render left and right views into one image: side by side for \pc{PERSP} and \pc{FISHEYE}, top-bottom for \pc{VR360} (the format headset video players expect). Not for \pc{ORTHO}. Doubles the render time. \\
+\pc{STEREO\_DEPTH} & \pc{1/30} & Eye separation as a fraction of the camera distance (kept as the camera moves); larger gives stronger 3D. Material at the box centre appears at screen depth. \\
+\pc{TIME\_LABEL} & \pc{None} & Optional label burned into the top-left corner of every frame, e.g.\ \pc{"  t = \{hours:.1f\} h"}; \pc{\{seconds\}}, \pc{\{hours\}} and \pc{\{days\}} are the snapshot time, taken as the number in its file name times \pc{SNAPSHOT\_NAME\_S}. \pc{TIME\_LABEL\_SIZE} sets the font size in pixels. Best with \pc{PERSP} or \pc{ORTHO}: on the dome or headset that corner is out of view. \\
+\hline
+\multicolumn{3}{c}{\textbf{Colour (body, particles and mist)}}\\
+\hline
+\pc{ROCK\_RGB}, \pc{IRON\_RGB} & -- & The materials' own colours, lit by the suns; darker values give a darker crust. \\
+\pc{GLOW\_K} & \pc{(2800, 16000)} & Glow strength rises smoothly (in $\log T$) from 0 to 1 between these temperatures. Raise them to keep the glow to the hottest material; the stage-1 surface temperature percentiles are a guide. May instead be \{snapshot frame: (low, high), \ldots\}, e.g.\ \pc{\{0: (2800, 16000), 2160: (5000, 25000)\}}: the range then changes smoothly between those frames, and the template carries the animation into stage~3. \pc{PALETTE\_SHIFT}, \pc{BODY\_EMIT\_GAIN}, \pc{EMIT\_GAIN} and \pc{MIST\_EMIT\_GAIN} can change with time in the same way. \\
+\pc{PALETTE\_SHIFT} & \pc{1.0} & The glow colour is taken from \pc{PALETTE} at temperature $\times$ this factor, so values above 1 make glowing material whiter without changing which material glows. May change with time, e.g.\ \pc{\{0: 3, 300: 3, 600: 1\}} for white-hot cracks during the impact only. \\
+\pc{PALETTE} & 2500--40000\,K & Temperature (K) $\rightarrow$ glow colour stops, interpolated in $\log T$; the top stop (40\,000\,K) is white-hot, reached by the hottest mist or with \pc{PALETTE\_SHIFT} $>1$. \\
+\hline
+\multicolumn{3}{c}{\textbf{Particles (body and rest)}}\\
+\hline
+\pc{PARTICLE\_RADIUS} & \pc{0.005} & Base sphere radius (Blender units), scaled by \pc{radius\_factor} (0.5--1). 0.004--0.005 keeps the mantle opaque over the core. \\
+\pc{EMIT\_GAIN} & \pc{1.0} & Glow strength of the hottest dense particles. \\
+\pc{DEBRIS\_EMIT\_FRAC} & \pc{0.3} & Fraction of that glow for the least dense particles (\pc{radius\_factor} 0.5), rising to 1 at \pc{RHO\_BODY}. \\
+\pc{PARTICLE\_ALPHA} & \pc{0.7} & Opacity, multiplied by the rest particles' density fade. Lower is gassier, but lets the core show through and dims the glow. \\
+\pc{PARTICLE\_COLOURS} & \pc{HEAT} & \pc{HEAT}: material colour, lit, glowing with temperature. \pc{BODY}: a fixed colour for each of target and impactor rock and iron (\pc{BODY\_COLOURS}), with a little self-glow (\pc{BODY\_GLOW}), to show where the impactor's material ends up. \\
+\pc{CUTAWAY} & \pc{None} & Remove the particles on the near side of a plane through the target's centre (the centre of mass of its dense material, recorded by stage~1 for each frame), showing the layers inside. \pc{"CAMERA"}: the plane faces the camera and turns with it; or the plane's normal in simulation axes, e.g.\ \pc{(0, 0, 1)} removes $z>0$. Particles only: meshes and mist are not cut, so use \pc{PARTICLES} mode. \\
+\hline
+\multicolumn{3}{c}{\textbf{Mesh body}}\\
+\hline
+\pc{BODY\_EMIT\_GAIN} & \pc{1.0} & Glow strength of the hottest surface. \\
+\hline
+\multicolumn{3}{c}{\textbf{Mist}}\\
+\hline
+\pc{VDB\_RES} & \pc{128} & Mist grid cells per side in the \pc{.vdb} files. \\
+\pc{MIST\_DENSITY}, \pc{MIST\_EMIT\_GAIN} & \pc{0.5}, \pc{0.05} & Opacity of the densest mist, and glow of the densest, hottest mist. Cycles (stage~3) shows the mist differently from EEVEE (test renders), so check it in a stage-3 render. \\
+\pc{MIST\_FADE\_RHO} & \pc{(1, 1000)} & Mist opacity and glow rise smoothly (in log density) from zero to full between these densities (kg\,m$^{-3}$), as \pc{REST\_FADE\_RHO} does for particles: the mist is strongest next to the body and fades away in thin, distant material. Raise the lower value to pull the mist in towards the body. Set in the material, so changing it needs no new volume or \pc{.vdb} files. \\
+\pc{VDB\_SMOOTH} & \pc{2} & Smoothing passes on the mist grid when writing the \pc{.vdb} files. \\
+\hline
+\end{longtable}
+}
+ 
+\subsection{Anticipated operation}
+On mad06, or another machine with GPUs,\newline
+\pc{blender -b -P combined\_02\_build.py -- 300-319}\newline
+renders those test frames; repeat until happy with the look. All of this tinkering can also be done in the Blender GUI, but it is slow and has a great many options; there are some hints in section~\ref{sec:gui}. When content, set \pc{MAKE\_TEMPLATE = True} to make the template for the whole simulation. To test the whole pipeline quickly on a mist mode, run stage~1 on frames \pc{800-805} only, set \pc{TEMPLATE\_FRAME = 800}, make the template (\pc{.vdb} files are built only where volume files exist) and render just those frames in stage~3. If two modes' stage-2 test runs are made at once, their test renders overwrite each other in \pc{renders/}; the templates are safe.
+ 
+\subsection{Typical resources used}
+Test frames take seconds each. Writing the \pc{.vdb} files for a mist mode takes $\sim$30\,min for 2160 frames (from half-precision volume files; 1\,h\,50\,min before) at \pc{VDB\_RES} $=128$ and fills $\sim$15\,GB; this is only paid again for files whose volume, \pc{VDB\_RES} or \pc{VDB\_SMOOTH} has changed, and \pc{PARTICLES\_MIST} and \pc{MESH\_MIST} share the same files. Even with every \pc{.vdb} file up to date, a template run takes several minutes, up to $\sim$15\,min when the shared filesystem is busy, because it checks every file; it reports progress every 250 frames. Fisheye and 360-degree check frames render in Cycles on the GPU with 16 samples.
+ 
+% =====================================================================
+\section{Stage 3 -- rendering using Blender}
+% =====================================================================
+\pc{combined\_03\_render\_chunk.py} opens the template and, for each frame in the range given on the command line, imports that frame's files, attaches the template's materials and Geometry Nodes, renders a \pc{.png} with Cycles on the GPU, and deletes the frame's objects again. It reads the mode and component files from the template, and stops with an error if the \pc{.blend} was saved in test mode or by an older stage~2. \pc{render\_chunks.sh} splits a whole run into chunks and runs several Blender processes at once.
+ 
+\subsection{Important parameters}
+ 
+{\small
+\begin{longtable}{@{}P{4.3cm} P{2.0cm} P{8.2cm}@{}}
+\hline
+\textbf{Parameter} & \textbf{Default} & \textbf{Effect} \\
+\hline
+\endhead
+\multicolumn{3}{c}{\textbf{Shell wrapper: \pc{render\_chunks.sh}}}\\
+\hline
+\pc{SIM\_NAME}, \pc{MODE}, \pc{CAMERA} & -- & Pick the template \pc{SIM\_NAME\_MODE\_CAMERA.blend}. \pc{MODE} is the lower-case \pc{RENDER\_MODE}, e.g.\ \pc{mesh\_mist}, and \pc{CAMERA} the lower-case \pc{CAMERA\_MODE}, e.g.\ \pc{persp}, with \pc{\_3d} added for stereo; \textbf{check these match the template you just made.} \\
+\pc{START\_FRAME}, \pc{END\_FRAME}, \pc{CHUNK} & 0, 2160, 100 & Range of frames, and frames per Blender process. \\
+\pc{MAX\_PARALLEL} & 8 & Concurrent Blender processes, limited by GPU memory ($\sim$4\,GB each). \\
+\pc{NTHREAD} & 10 & CPU threads per Blender process; \pc{MAX\_PARALLEL}$\times$\pc{NTHREAD} $\le$ 128 on mad06. \\
+\pc{BLENDER\_BIN}, \pc{OUT\_DIR}, \pc{RENDER\_SCRIPT} & -- & Blender executable, log directory, and path to \pc{combined\_03\_render\_chunk.py}. \\
+\hline
+\multicolumn{3}{c}{\textbf{Blender renderer: \pc{combined\_03\_render\_chunk.py}}}\\
+\hline
+\pc{BODY\_ON}, \pc{REST\_ON} & \pc{True} & Switch components off at render time without rebuilding the template. \\
+\pc{SAMPLES} & 16 & Cycles samples (denoising is on); the main speed-versus-noise setting. \\
+\pc{SMOOTH\_BODY} & \pc{True} & Smooth-shade the mesh body. \\
+\hline
+\end{longtable}
+}
+ 
+\subsection{Anticipated operation}
+First render a few frames by hand and check them, e.g.\newline
+\pc{blender --factory-startup -t 8 -b TEMPLATE.blend -P combined\_03\_render\_chunk.py -- 0 2}\newline
+More than one frame is needed to check that each frame's objects are cleared properly. Then run the whole range on mad06 with\newline
+\pc{./render\_chunks.sh}\hfill(or \pc{./render\_chunks.sh 300 599} for a sub-range)\newline
+or through the queue with \pc{sbatch stage3\_slurm.sh}, a job array that gives each task a whole GPU node in \pc{hardwarelab-gpu} and runs \pc{render\_chunks.sh} on its share of the frames there (\pc{--array=0-3} uses up to four nodes; \pc{sbatch -w mad06 --array=0 stage3\_slurm.sh} keeps to mad06). \pc{MAX\_PARALLEL} (default 8) sets the renders per GPU, and their threads share out the node's cores; use $\sim$5 for \pc{PARTICLES} modes. Each task asks for one GPU and 64 cores rather than a whole node, so others can use the rest. On a GPU type new to the Blender build (mad06's build was compiled for its A100), Cycles first compiles its GPU code, which takes 4--6\,min per process; it is then cached in \pc{\textasciitilde/.cache/cycles} and reused on every node, so render one frame alone on a new GPU type first. The H100 (gn004) and RTX Pro 6000 (gn005) work this way; ga008's AMD GPUs are not supported by the build and are excluded.\newline
+and watch the GPU with \pc{watch -n 2 nvidia-smi}. Each chunk writes a log to \pc{OUT\_DIR}. Lines about \pc{libur\_loader.so.0: no version information available} and \pc{HIPEW initialization failed} come from the oneAPI and AMD libraries and can be ignored. Afterwards, check that there is one \pc{.png} per frame and that no log reports running out of memory:\newline
+\pc{ls renders\_MODE/frame\_*.png | wc -l}\newline
+\pc{grep -il "out of memory" OUT\_DIR/render\_*.log}\newline
+A chunk that failed can be re-rendered on its own by giving its frame range after \pc{--} as above.
+ 
+\subsection{Typical resources used}
+Each Blender process takes $\sim$4\,GB of GPU memory; mad06 has 40\,GB in total, shared with other users, and 128 cores. Each frame spends part of its time on the CPU (importing files), so the GPU is idle about half the time and more processes help, as far as memory allows; raising \pc{SAMPLES} also costs less than proportionally. For 2160 frames of $3\times10^6$ particles:
+ 
+\begin{center}\small
+\begin{tabular}{@{}P{4.4cm} P{4.6cm} P{5.5cm}@{}}
+\hline
+\textbf{Mode} & \textbf{\pc{MAX\_PARALLEL} $\times$ \pc{NTHREAD}} & \textbf{Time} \\
+\hline
+\pc{MESH\_MIST} (new colour model, half-precision mist) & 10 $\times$ 12 & 42\,min (3 $\times$ 16 took 105\,min with the old files) \\
+\pc{PARTICLES} & 5 $\times$ 10 & 56\,min \\
+\pc{PARTICLES\_MIST} & 8 $\times$ 10 & 37\,min \\
+\pc{MESH\_MIST}, \pc{FISHEYE} 4096$^2$ & 10 $\times$ 12, \pc{CHUNK} 50 & 4\,h\,20\,min; $\sim$10 frames failed for lack of GPU memory (3.6--4\,GB per job), so use \pc{MAX\_PARALLEL} $\le$ 8 for panoramas \\
+\hline
+\end{tabular}
+\end{center}
+ 
+% =====================================================================
+\section{Stage 4 -- making and viewing an animation}
+\label{sec:movie}
+% =====================================================================
+Something like (replace \pc{renders\_particles\_mist} with the folder for your mode, and \pc{frame} with the prefix of your camera, e.g.\ \pc{fish} or \pc{vr360\_3d}):
+\begin{verbatim}
+ffmpeg -framerate 30 -i renders_particles_mist/frame_%04d.png \
+       -c:v libx264 -pix_fmt yuv420p -crf 18 giant_impact.mp4
+\end{verbatim}
+For a sequence that does not start at frame 0--4 (e.g.\ a test of frames 300--319), add \pc{-start\_number 300} before \pc{-i}; a short test is easier to judge at \pc{-framerate 10}. Then
+\begin{verbatim}
+mplayer -loop 0 giant_impact.mp4
+\end{verbatim}
+For a headset, a stereo \pc{VR360} movie is 4096$\times$4096 (top-bottom); \pc{-c:v libx265 -tag:v hvc1} instead of \pc{libx264} gives a smaller file that headsets decode more readily. Most headset video players recognise the format from the file name, e.g.\ \pc{giant\_impact\_360\_TB.mp4}; otherwise choose ``360\textdegree, top-bottom'' in the player.
+ 
+% =====================================================================
+\section{Keeping files up to date}
+\label{sec:stale}
+% =====================================================================
+You never need to delete files or set flags to make the pipeline redo work. Every file written by stages~1 and~2 carries a \emph{fingerprint}: a short hash of the settings it was made with, stored inside the file itself (a comment line in a \pc{.ply} header, an extra entry in a \pc{.npz}, file metadata in a \pc{.vdb}), so it costs no extra files. Files are written under a temporary name and renamed when complete, so a job that is killed never leaves a half-written file that looks finished. On each run a file is remade only if it is missing or its fingerprint differs from that of the current settings; otherwise the frame is reported as \pc{[up to date]}. The body and rest files are judged separately, so changing \pc{REST\_FADE\_RHO}, say, remakes only the rest particles and leaves the expensive meshes alone. A \pc{.vdb} file's fingerprint includes that of its volume file, so stage~2 rebuilds exactly the \pc{.vdb} files whose volume was remade or whose \pc{VDB\_RES} or \pc{VDB\_SMOOTH} changed. This is why the \pc{.vdb} files are made in stage~2: Blender's Python has \pc{openvdb}, and a \pc{.vdb} file survives any change to the body or particle look.
+ 
+\begin{center}\small
+\begin{tabular}{@{}P{3.4cm} P{9.6cm}@{}}
+\hline
+\textbf{Files} & \textbf{Fingerprint includes} \\
+\hline
+all stage-1 files & \pc{FORMAT\_VERSION}, \pc{BOX\_SIZE}, \pc{BLENDER\_UNIT\_M}, \pc{SURFACE\_RHO}, \pc{MIN\_NEIGHBOURS}, \pc{IRON\_ID} \\
+meshes & + \pc{SPLASH\_*} \\
+particles & + \pc{RHO\_DEBRIS}, \pc{RHO\_BODY}, \pc{TARGET\_MAX\_ID}; and \pc{REST\_FADE\_RHO} for rest particles \\
+volume files & + \pc{RESOLUTION} \\
+\pc{.vdb} files & volume file's fingerprint, \pc{VDB\_RES}, \pc{VDB\_SMOOTH} \\
+\hline
+\end{tabular}
+\end{center}
+ 
+One caution: only the settings listed are tracked, so if you change the code itself (rather than a setting at the top), add one to \pc{FORMAT\_VERSION} to have everything remade. And a file with no fingerprint (made by an older version of the scripts) counts as out of date and is remade.
+ 
+% =====================================================================
+\section{Checklist before a full run}
+% =====================================================================
+\textbf{Stage 1:} \pc{SIM\_NAME}, \pc{BASE\_DIR}; \pc{RENDER\_MODE}; \pc{BOX\_SIZE}; densities (\pc{SURFACE\_RHO}, \pc{REST\_FADE\_RHO}).
+ 
+\textbf{\pc{stage1\_slurm.sh}:} \pc{--array}, \pc{--cpus-per-task} and \pc{--mem} for the mode (table above); \pc{-t}; the frame range.
+ 
+\textbf{Stage 2:} \pc{SIM\_NAME}, \pc{BASE\_DIR} and \pc{RENDER\_MODE} as in stage~1; \pc{MAKE\_TEMPLATE = True}; \pc{CAMERA\_MODE}; the look parameters for your mode.
+ 
+\textbf{Stage 3:} \pc{BODY\_ON}/\pc{REST\_ON}; \pc{SAMPLES}.
+ 
+\textbf{\pc{render\_chunks.sh}:} \pc{SIM\_NAME}, \pc{MODE} and \pc{CAMERA} (the settings most easily forgotten when switching); \pc{START\_FRAME}, \pc{END\_FRAME}, \pc{CHUNK}; \pc{MAX\_PARALLEL} for the GPU memory free; \pc{MAX\_PARALLEL}$\times$\pc{NTHREAD} $\le$ 128.
+ 
+\begin{center}\small
+\begin{tabular}{@{}P{9.5cm} P{3.5cm}@{}}
+\hline
+\textbf{Changed} & \textbf{Re-run} \\
+\hline
+Density thresholds, box, mesh or mist-grid settings & stages 1 $\rightarrow$ 2 $\rightarrow$ 3 (only affected files are remade) \\
+Colours, glow, particle size, alpha, mist look, camera, \pc{VDB\_RES} & stages 2 $\rightarrow$ 3 \\
+\pc{SAMPLES}, components on/off at render time, frame range & stage 3 only \\
+\hline
+\end{tabular}
+\end{center}
+ 
+% =====================================================================
+\section{The most useful Blender controls}
+\label{sec:gui}
+% =====================================================================
+This section is for taking a saved \pc{.blend} and adjusting it. Open the \pc{.blend} saved by a stage-2 \emph{test} run (\pc{MAKE\_TEMPLATE = False}), which still contains the test frames; the template contains no per-frame geometry, so there is nothing to see in it until stage~3 imports a frame. Changes you make by hand are not picked up by the scripts, so once you have found settings you like, copy them into the stage-2 parameters. Click-paths are
+for Blender~5.1; menu labels move slightly between versions, so verify against
+your build. Where a name is version-sensitive it is flagged.
+ 
+\subsection{Rendered view, and EEVEE vs Cycles}
+The four shading buttons at the top-right of the 3-D viewport are Wireframe,
+Solid, Material Preview, and \textbf{Rendered} (rightmost). Click Rendered to
+see lights, emission and bloom; press \pc{Z} for the same as a pie menu.
+ 
+Choose the engine in \textbf{Properties $\rightarrow$ Render Properties} (the
+camera-back icon in the column of icons tabs running down the right-hand-side of your screen) $\rightarrow$ \emph{Render Engine}:
+\begin{itemize}
+  \item \textbf{EEVEE} -- fast renderer, near real-time; stage~2 uses it for test renders except with the fisheye camera. Good for previewing and for standard flat renders.
+ 
+  \item \textbf{Cycles} -- path-traced; slower but physically accurate. Stage~3 always renders with Cycles on the GPU.
+        \textbf{Required for the planetarium fisheye/dome}, because the
+        panoramic/fisheye lens is a Cycles feature. For a fulldome master:
+        switch to Cycles, select the camera (in the top-right object list to highlight it), \textbf{Camera Data Properties (the green camera icon on the right column)
+        $\rightarrow$ Lens $\rightarrow$ Type: Panoramic $\rightarrow$ Panorama
+        Type: Fisheye Equidistant}, and set a square resolution (e.g.\
+        4096$\times$4096, as \pc{CAMERA\_MODE = "FISHEYE"} does).
+\end{itemize}
+ 
+\subsection{Rendering: single frame, animation, output, resolution, samples}
+\begin{itemize}
+  \item \textbf{Single frame:} \textbf{Render $\rightarrow$ Render Image}
+        (\pc{F12}). \textbf{Animation:} \textbf{Render $\rightarrow$ Render
+        Animation} (\pc{Ctrl+F12}).
+  \item \textbf{Where files go:} \textbf{Output Properties} (printer icon)
+        $\rightarrow$ the output path field. Single-image renders open in a
+        window and are saved with \emph{Image $\rightarrow$ Save As}; animations
+        write to the path automatically.
+  \item \textbf{Resolution / aspect ratio:} \textbf{Output Properties
+        $\rightarrow$ Format $\rightarrow$ Resolution X/Y} and the \emph{\%}
+        scale. Aspect ratio is X:Y (the scripts use 1280$\times$720); use a
+        square ratio for dome output.
+  \item \textbf{File format:} \textbf{Output Properties $\rightarrow$ Output
+        $\rightarrow$ File Format} -- \emph{PNG} for a frame sequence, or
+        \emph{FFmpeg Video} for a direct MP4 (see section~\ref{sec:movie}).
+  \item \textbf{Samples (noise vs speed):} \textbf{Render Properties
+        $\rightarrow$ Sampling}. In Cycles raise \emph{Render} samples to reduce
+        noise; in EEVEE the equivalent is \emph{Samples}. Cycles also has a
+        \emph{Denoise} toggle worth enabling.
+\end{itemize}
+ 
+\subsection{Cameras, including an orbiting camera}
+The scene \emph{already contains a camera} called \pc{Cam} (the one the script
+set up). The active camera is the one with the filled
+triangle marker in the \textbf{Outliner} (top-right object list); to make a
+selected camera active, \textbf{View $\rightarrow$ Cameras $\rightarrow$ Set
+Active Object as Camera} (\pc{Ctrl+Numpad~0}). Look through it with
+\pc{Numpad~0}.
+ 
+\textbf{Aim it by hand:} navigate the viewport to the angle you want, then
+\textbf{View $\rightarrow$ Align View $\rightarrow$ Align Active Camera to View}
+(\pc{Ctrl+Alt+Numpad~0}). Fine-tune in the \pc{N} panel (\emph{Item
+$\rightarrow$ Transform}). The scene is centred on the origin, \textbf{(0,~0,~0)}, and lengths are in the simulation's length unit (Earth radii here). Note that the script
+keyframes the camera's location and rotation, so a hand-aimed camera is
+overridden on other frames unless you re-key it or delete those keyframes.
+ 
+\textbf{Orbit it around the collision.} The reliable recipe is to pivot the
+camera around an empty at the centre, \emph{and} lock it to look at that empty
+so it can never tilt off on its own:
+\begin{enumerate}
+  \item \textbf{Add $\rightarrow$ Empty $\rightarrow$ Plain Axes.} In the \pc{N}
+        panel set its \emph{Location} to \textbf{(0,~0,~0)}. Everything orbits
+        this point, so it must sit at the centre, not on the camera.
+  \item \textbf{Point the camera at the empty.} Select the camera, open
+        \textbf{Object Constraint Properties} (the chain-link icon in the
+        right-hand tab column, a few below the orange Object square),
+        \textbf{Add Object Constraint $\rightarrow$ Track To}. Set \emph{Target}
+        = the empty, \emph{Track Axis} = \pc{-Z}, \emph{Up} = \pc{Y}. The camera
+        now always faces the centre -- this is what stops the ``looking up, back
+        and down'' tumble.
+  \item \textbf{Parent the camera to the empty.} Click the camera, then
+        \pc{Shift}-click the empty (order matters -- the \emph{last} clicked
+        becomes the parent), and press \pc{Ctrl+P} $\rightarrow$ \textbf{Object
+        (Keep Transform)}. Spinning the empty now carries the camera with it.
+  \item \textbf{Animate the spin -- about the vertical Z axis.} Select the
+        empty. On frame~1, in the \pc{N} panel set \emph{Rotation~Z} = 0,
+        right-click that field $\rightarrow$ \emph{Insert Single Keyframe}. Go to
+        the last frame, set \emph{Rotation~Z} = 360, right-click $\rightarrow$
+        \emph{Insert Single Keyframe}. Use \emph{Z} (the blue up-axis):
+        animating \emph{X} or \emph{Y} instead is exactly what rolls the camera
+        up and over rather than circling it.
+  \item \textbf{Make the speed constant.} In a \textbf{Graph Editor}, select the
+        rotation curve and set \textbf{Channel $\rightarrow$ Interpolation Mode
+        $\rightarrow$ Linear} (\pc{T} $\rightarrow$ Linear).
+\end{enumerate}
+ 
+\noindent\textbf{If it just spins on the spot:} the empty is not
+at the centre -- it is sitting on the camera, so the orbit radius is zero; fix
+its location to (0,~0,~0). Or the camera was not actually parented -- re-do
+step~3 with the empty clicked \emph{last}; or you keyed \emph{X}/\emph{Y}
+rotation instead of \emph{Z}. The Track-To constraint in step~2 guarantees the
+camera keeps facing the collision, so once it is orbiting it cannot pitch away.
+ 
+\subsection{Viewing in VR}
+Blender's VR is the built-in \textbf{VR Scene Inspection} add-on (OpenXR), for
+looking around the scene from inside a headset. Enable and start it as follows:
+\begin{enumerate}
+  \item \textbf{Edit $\rightarrow$ Preferences $\rightarrow$ Add-ons}, search
+        \emph{VR}, and tick \textbf{3D View: VR Scene Inspection}.
+  \item Open the viewport \pc{N} panel; a new \textbf{VR} tab appears. Under it,
+        click \textbf{Start VR Session}.
+\end{enumerate}
+\noindent This needs an OpenXR runtime (SteamVR, Meta/Oculus, or Windows Mixed
+Reality) and a connected headset; it is best supported on Windows, with Linux
+OpenXR (e.g.\ Monado) still experimental. VR inspection runs in the
+\emph{real-time viewport}, so it uses EEVEE, not Cycles -- it is a separate thing
+from the offline Cycles fisheye render used for a fulldome master.
+ 
+\subsection{Lighting}
+For flat cameras (\pc{PERSP}, \pc{ORTHO}) the scene contains a \textbf{key sun} (\pc{KeySun}, energy 4.0) and a dimmer
+\textbf{fill sun} (\pc{FillSun}, energy 1.2), turned with \pc{CAMERA\_VIEW} so they light the bodies the same way from any viewing side. A dome or headset view sees bodies in widely different directions, where fixed suns would light each from a different side; for \pc{FISHEYE} and \pc{VR360} the suns are replaced by a lamp at the camera (\pc{CameraLamp}), which lights everything from the viewer's direction. \pc{LAMP\_STRENGTH} (3, in sun units) sets how strongly; its power is keyframed with the camera path so the bodies stay equally bright as the camera moves in and out. Select a light in the
+\textbf{Outliner}, then \textbf{Object Data Properties} (the lightbulb icon) to
+change \emph{Strength}/energy and, for suns, \emph{Angle} (softness of
+shadows). Rotate a sun in the \pc{N} panel (\emph{Item $\rightarrow$ Rotation})
+to move the highlight across the body. Add more with \textbf{Add $\rightarrow$
+Light $\rightarrow$ Area/Point/Sun}. Because the material is also self-emissive,
+lights mainly shape the lit rock; raising \pc{BODY\_EMIT\_GAIN} or \pc{EMIT\_GAIN} in stage~2 has
+more effect on the molten glow.
+ 
+\subsection{Changing materials safely, and re-rendering}
+The materials are \pc{BodyLook} (mesh body), \pc{ParticleLook} (all particles) and \pc{MistLook} (volume); a template contains those its mode uses. Select an object, open the
+\textbf{Shading} workspace (top tab) or \textbf{Material Properties}
+(checkerboard-sphere icon) to see the node graph. Particles get their material from the \emph{Set Material} node inside their Geometry Nodes modifier rather than from the object's material slot.
+\begin{itemize}
+  \item \textbf{Glow / opacity / size} are Blender-side: adjust the emission
+        chain (the \emph{Math: Multiply} node feeding \emph{Emission Strength},
+        i.e.\ \pc{BODY\_EMIT\_GAIN} / \pc{EMIT\_GAIN}), or edit the stage-2
+        parameters and re-run stage~2 only. No stage-1 rerun needed.
+  \item \textbf{Colour} for every material is in the \pc{HeatLook} node group
+        (open it with \pc{Tab} on the group node): the rock and iron colours, the
+        palette ramp and the glow range. A change there applies to body,
+        particles and mist at once. To make it permanent, copy it into the
+        stage-2 parameters (\pc{ROCK\_RGB}, \pc{PALETTE}, \pc{GLOW\_K}).
+  \item \textbf{Re-render} after any change with \pc{F12} (frame) or
+        \pc{Ctrl+F12} (animation). Save incremental \pc{.blend} copies so a
+        tweak is easy to undo.
+\end{itemize}
+ 
+\noindent\textbf{Version notes.} The scripts are written for Blender~5.x: they use the \pc{wm.ply\_import} importer and handle the layered actions of 4.4+ when keyframing visibility. This matters only if you script further.
+ 
+% =====================================================================
+\appendix
+% =====================================================================
+\section{macOS / Windows equivalents}
+Everything above is Linux-first. The only differences are the shell and the
+Blender executable path.
+ 
+\textbf{Environment activation:} conda is identical on all platforms
+(\pc{conda activate giantimpact}); for a venv, Windows uses
+\pc{giantimpact\textbackslash Scripts\textbackslash activate}.
+ 
+\textbf{Blender executable} (replace \pc{blender} in the stage-2 commands):
+\begin{verbatim}
+Linux  :  blender
+macOS  :  /Applications/Blender.app/Contents/MacOS/Blender
+Windows:  "C:\Program Files\Blender Foundation\Blender 5.1\blender.exe"
+\end{verbatim}
+On Windows, match the version number in the path to your install; use the
+Anaconda Prompt as the shell.
+ 
+\end{document}

@@ -1,0 +1,58 @@
+# Rendering giant-impact simulations in Blender
+
+A pipeline that turns [SWIFT](https://swift.strw.leidenuniv.nl/) smoothed-particle
+hydrodynamics snapshots of planetary giant impacts into rendered animations with
+[Blender](https://www.blender.org/): flat movies, planetarium fulldome (fisheye)
+masters, and 360° (optionally stereo) movies for VR headsets.
+
+The full guide, with every setting, typical run times and memory, and hints for
+working in the Blender GUI, is in [`Blender_notes.pdf`](Blender_notes.pdf).
+
+## How it works
+
+| Stage | Script | Runs in | What it does |
+|---|---|---|---|
+| 1 | `combined_01_make.py` | Python 3.10+ (CPU) | Reads each snapshot, splits the material into a dense **body** and the thinner **rest**, and writes Blender-ready files: a surface mesh of the body (via [splashsurf](https://github.com/InteractiveComputerGraphics/splashsurf)), particle clouds, and density/temperature grids for a volumetric mist. |
+| 2 | `combined_02_build.py` | Blender's Python | Sets the look (colour from temperature, glow, mist), camera and lights; renders test frames, then saves a template `.blend` for the chosen render mode and camera. |
+| 3 | `combined_03_render_chunk.py` | Blender (GPU) | Renders a range of frames from the template. `render_chunks.sh` runs several at once on one GPU; `stage3_slurm.sh` spreads them over GPU nodes. |
+
+`stage1_slurm.sh` runs Stage 1 as a Slurm job array. `camera_clearance.py` checks
+how close material comes to the camera for different viewing directions, which
+matters for dome and headset viewing.
+
+**Render modes** combine a body style and a rest style: `PARTICLES`,
+`MESH_PARTICLES`, `MESH_MIST` and `PARTICLES_MIST`. **Cameras**: `PERSP`,
+`ORTHO` (top-down), `FISHEYE` (dome) and `VR360` (headset), each optionally in
+stereo. Particle modes can also colour material by its source body (target or
+impactor) and cut the bodies open to show their interiors.
+
+Every output file carries a fingerprint of the settings it was made with, so each
+stage remakes only what is out of date.
+
+## Requirements
+
+- Stage 1: Python ≥ 3.10 with `numpy`, `scipy`, `h5py`, `swiftsimio` and `pysplashsurf`.
+- Stages 2–3: Blender 5.x (tested with 5.0–5.3), with an NVIDIA GPU for Cycles.
+
+## Getting started
+
+The settings sit at the top of each script. Set the simulation name and
+directories (`SIM_NAME`, `BASE_DIR`) in Stages 1 and 2, and the paths and Slurm
+account in the shell scripts, then follow the workflow in section 2 of
+`Blender_notes.pdf`:
+
+```
+python3 combined_01_make.py 0-2160/200            # Stage 1 on a few frames
+blender -b -P combined_02_build.py -- 200 600     # Stage 2 test renders
+sbatch stage1_slurm.sh                            # Stage 1, all frames
+blender -b -P combined_02_build.py                # template (MAKE_TEMPLATE = True)
+./render_chunks.sh                                # Stage 3
+```
+
+## Authors
+
+Vincent Eke and Callum Mosley, Institute for Computational Cosmology, Durham University.
+
+## Licence
+
+MIT: see [`LICENSE`](LICENSE).
